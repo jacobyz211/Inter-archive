@@ -1,0 +1,12 @@
+name = "eclipse-internet-archive"
+main = "index.js"
+compatibility_date = "2024-11-01"
+workers_dev = true
+
+# No KV/D1/R2 bindings needed — archive.org is fully public and requires
+# no auth, tokens, or secrets. All caching is in-memory (per isolate) in
+# index.js. Rename `name` above to whatever subdomain you want this worker
+# to live at (it becomes https://<name>.<your-subdomain>.workers.dev).
+
+[observability]
+enabled = true
