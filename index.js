@@ -1,36 +1,33 @@
 /**
  * Internet Archive Addon — Cloudflare Worker (for Eclipse Music)
  *
- * v5 — ARTWORK SIZE, HUGE-ITEM PAGINATION, FLAC/MP3 GROUPING FIX:
- * - FIXED covers rendering huge/off-screen again: archive.org's
- *   /services/img/{id} endpoint does NOT always serve a proper small
- *   thumbnail — for any item that never had a derived thumbnail
- *   generated, it serves the ORIGINAL SOURCE IMAGE directly, which can
- *   be a multi-megapixel raw scan. Every artwork URL now requests an
- *   explicit `?w=500` (archive.org honors width-constrained thumbnail
- *   requests), so even un-derived items get a bounded-size image instead
- *   of whatever raw file happens to be attached.
- * - FIXED "some albums not loading" / "artist pages huge, completely off
- *   screen": some archive.org items (78rpm compilations, old-time radio
- *   box sets, etc.) contain hundreds to thousands of audio files. album/
- *   artist/playlist responses are now capped at a sane max track count
- *   (ALBUM_TRACK_LIMIT) with a `truncated`/`totalTracks` hint, instead of
- *   returning every single file — that's what was producing enormous
- *   payloads that either timed out entirely or rendered as absurdly long
- *   pages.
- * - FIXED "quality only ever shows mp3, never flac": the file-grouping
- *   logic that merges different renditions of the same track (so the
- *   best format wins) was comparing cleaned filenames directly, but
- *   archive.org's auto-derived MP3s commonly append a bitrate/encoding
- *   suffix the source file doesn't have (e.g. "trackname.flac" vs
- *   "trackname_vbr.mp3" or "trackname_64kb.mp3") — that suffix made them
- *   normalize to DIFFERENT keys, so the FLAC and MP3 were never actually
- *   compared against each other for the same logical track, and
- *   whichever one simply appeared "good enough" on its own could end up
- *   picked. normalizeBaseName now also strips common bitrate/encoding
- *   suffixes (_64kb, _vbr, _128kbps, etc.) before grouping, so FLAC vs
- *   MP3 renditions of the same recording are correctly recognized as
- *   the same track and the real winner is chosen by score.
+ * v6 — FINAL FIXES: grouping-by-track-number, artwork reverted to v3,
+ * no track caps.
+ *
+ * - FIXED FLAC/quality never showing: many archive.org live-concert
+ *   (etree) items name their lossless FLAC master completely differently
+ *   from their auto-derived MP3 ("gd77-05-08d1t01.flac" vs "01 - Song
+ *   Name.mp3") — no filename normalization can match those, so v5's
+ *   suffix-stripping fix still missed this very common case, and MP3
+ *   kept winning by default because it was never actually compared
+ *   against its FLAC counterpart. Grouping now keys primarily on TRACK
+ *   NUMBER metadata (which archive.org keeps consistent across
+ *   renditions of the same track regardless of filename scheme), falling
+ *   back to filename normalization only when no track number exists.
+ *   Also added a hard failsafe: if a lossless file (FLAC/WAV) exists
+ *   anywhere in a group and preferLossless is on, it is always chosen
+ *   over a lossy one regardless of scoring edge cases. `format` is the
+ *   only quality signal Eclipse can show on a track (per the addon spec,
+ *   the `quality` text field only exists in the /stream response, which
+ *   Eclipse skips whenever a track already has a streamURL) — so getting
+ *   `format` right is the actual fix.
+ * - REVERTED artwork to exactly v3 behavior per request: artworkURL is
+ *   only set when a real per-item cover file is found in the item's own
+ *   files (tagged Item Tile/Item Image/Thumbnail, or named cover/front/
+ *   folder). No generic archive.org thumbnail-service fallback, no width
+ *   constraints — omitted entirely when no real file exists.
+ * - REMOVED the album/artist/playlist track-count cap entirely per
+ *   request — every track is returned, no matter how large the item.
  */
 
 // ─── Config ─────────────────────────────────────────────────────────────────
@@ -42,8 +39,6 @@ const ADDON_ICON = "https://archive.org/images/glogo.jpg";
 const ARCHIVE_SEARCH_URL = "https://archive.org/advancedsearch.php";
 const ARCHIVE_METADATA_URL = "https://archive.org/metadata";
 const ARCHIVE_DOWNLOAD_URL = "https://archive.org/download";
-const ARCHIVE_THUMB_URL = "https://archive.org/services/img";
-const THUMB_WIDTH = 500; // v5: bounds archive.org's thumbnail service to a sane size
 
 const METADATA_TIMEOUT_FULL_MS = 15000;
 const METADATA_TIMEOUT_FAST_MS = 4000;
@@ -56,7 +51,6 @@ const ARTIST_TOP_TRACK_ITEMS = 5;
 const ARTIST_ALBUM_LIMIT = 24;
 const PLAYLIST_MAX_ITEMS = 30;
 const PLAYLIST_CONCURRENCY = 6;
-const ALBUM_TRACK_LIMIT = 150; // v5: caps huge multi-hundred-file items from blowing out album pages
 
 const METADATA_CACHE_TTL_MS = 10 * 60 * 1000;
 const metadataCache = new Map();
@@ -213,15 +207,7 @@ function buildArtistList(docs, rawQuery, limit) {
   const orderedNames = [...exact.keys(), ...partial.keys()];
   const hasCloseMatch = orderedNames.some((n) => n.toLowerCase() === q);
   const finalNames = hasCloseMatch ? orderedNames : [rawQuery.trim(), ...orderedNames];
-  const artworkFor = (name) => (exact.get(name) || partial.get(name) || docs[0]);
-  return finalNames.slice(0, limit).map((name) => {
-    const src = artworkFor(name);
-    return {
-      id: b64urlEncode({ c: name }),
-      name: cleanText(name, 60),
-      artworkURL: src ? albumArtwork(src.identifier) : undefined,
-    };
-  });
+  return finalNames.slice(0, limit).map((name) => ({ id: b64urlEncode({ c: name }), name: cleanText(name, 60) }));
 }
 
 // ─── Audio file filtering, scoring, grouping ───────────────────────────────
@@ -233,10 +219,13 @@ function isAudioFile(file) {
   if (!file || !file.name || !file.format) return false;
   return AUDIO_FORMAT_KEYWORDS.test(file.format);
 }
+function isLosslessFile(file) {
+  return /24bit flac|flac|wave|\bwav\b|apple lossless|alac/i.test(file.format || "");
+}
 
 function formatScore(file, preferLossless) {
   const f = (file.format || "").toLowerCase();
-  const lossless = /24bit flac|flac|wave|\bwav\b|apple lossless|alac/.test(f);
+  const lossless = isLosslessFile(file);
   if (preferLossless) {
     if (/24bit flac/.test(f)) return 100;
     if (/flac/.test(f)) return 95;
@@ -275,14 +264,6 @@ function mapFormatField(file) {
   return "mp3";
 }
 
-// v5: FIXED the actual grouping bug. archive.org's auto-derived MP3s
-// commonly carry a bitrate/encoding suffix the lossless source doesn't
-// have (e.g. "song.flac" vs "song_vbr.mp3" or "song_64kb.mp3"). Those
-// suffixes now get stripped BEFORE the extension/punctuation cleanup, so
-// both renditions normalize to the same key and actually get compared
-// against each other for best format — previously they silently became
-// two unrelated "tracks" and the real FLAC could lose out or never even
-// be seen as an alternative to the MP3.
 const RENDITION_SUFFIX_RE = /[_\-\s]?(64kb?ps?|128kb?ps?|192kb?ps?|256kb?ps?|320kb?ps?|vbr|64k|128k|192k|256k|320k)$/i;
 function normalizeBaseName(filename) {
   let base = String(filename || "").replace(/\.[a-z0-9]{2,5}$/i, "");
@@ -291,11 +272,7 @@ function normalizeBaseName(filename) {
     prev = base;
     base = base.replace(RENDITION_SUFFIX_RE, "");
   } while (base !== prev);
-  return base
-    .replace(/[_\-.]+/g, " ")
-    .replace(/\s+/g, " ")
-    .trim()
-    .toLowerCase();
+  return base.replace(/[_\-.]+/g, " ").replace(/\s+/g, " ").trim().toLowerCase();
 }
 
 function parseTrackNumber(file) {
@@ -306,6 +283,19 @@ function parseTrackNumber(file) {
   const m = (file.name || "").match(/^(\d{1,3})[\s._-]/);
   if (m) return parseInt(m[1], 10);
   return null;
+}
+
+// v6: THE actual fix for FLAC never being selected. Many live-concert
+// (etree) items name their FLAC master completely differently from their
+// MP3 derivative ("gd77-05-08d1t01.flac" vs "01 - Song Name.mp3") — no
+// filename cleanup can match those. Grouping now keys primarily on the
+// file's own `track` metadata number (which archive.org keeps consistent
+// across every rendition of the same track), falling back to filename
+// normalization only when no track number is present at all.
+function groupKeyForFile(file) {
+  const tn = parseTrackNumber(file);
+  if (tn != null) return `#${tn}`;
+  return `n:${normalizeBaseName(file.name)}`;
 }
 
 function parseDurationSeconds(file) {
@@ -338,11 +328,17 @@ function fileTitle(file) {
   return cleanText(cleaned, 90);
 }
 
+// v6: groups by track-number first (see groupKeyForFile), keeps every
+// member of the group, and — critically — applies a hard failsafe after
+// scoring: if ANY member of the group is lossless and preferLossless is
+// on, that lossless file is always the one chosen, regardless of any
+// scoring edge case. This directly guarantees FLAC wins whenever it's
+// genuinely present alongside an MP3 of the same track.
 function groupAudioFiles(files, preferLossless) {
   const audioFiles = (files || []).filter(isAudioFile);
   const groups = new Map();
   for (const file of audioFiles) {
-    const key = normalizeBaseName(file.name);
+    const key = groupKeyForFile(file);
     const score = formatScore(file, preferLossless);
     let g = groups.get(key);
     if (!g) {
@@ -352,6 +348,12 @@ function groupAudioFiles(files, preferLossless) {
     g.members.push(file);
     if (score > g.score) { g.file = file; g.score = score; }
     if (g.trackNumber == null) g.trackNumber = parseTrackNumber(file);
+  }
+  for (const g of groups.values()) {
+    if (preferLossless && !isLosslessFile(g.file)) {
+      const losslessMember = g.members.find(isLosslessFile);
+      if (losslessMember) g.file = losslessMember;
+    }
   }
   const list = [...groups.values()];
   list.sort((a, b) => {
@@ -373,20 +375,16 @@ function creatorName(meta) {
   return cleanText(names.join(", "), 60);
 }
 
-// v5: width-constrained thumbnail request — bounds archive.org's
-// fallback-to-original-image behavior for items with no derived
-// thumbnail, which is what was rendering as huge/off-screen covers.
-function albumArtwork(identifier) {
-  return `${ARCHIVE_THUMB_URL}/${encodeURIComponent(identifier)}?w=${THUMB_WIDTH}`;
-}
+// v6: reverted exactly to v3 behavior per request — real per-item cover
+// file only, omitted entirely (no service-thumbnail fallback) when none
+// exists.
 function resolveArtwork(identifier, files) {
-  if (Array.isArray(files)) {
-    const tagged = files.find((f) => f.name && IMAGE_EXT.test(f.name) && /item tile|item image|thumbnail/i.test(f.format || ""));
-    if (tagged) return downloadUrl(identifier, tagged.name);
-    const named = files.find((f) => f.name && IMAGE_EXT.test(f.name) && /cover|front|folder/i.test(f.name));
-    if (named) return downloadUrl(identifier, named.name);
-  }
-  return albumArtwork(identifier);
+  if (!Array.isArray(files)) return undefined;
+  const tagged = files.find((f) => f.name && IMAGE_EXT.test(f.name) && /item tile|item image|thumbnail/i.test(f.format || ""));
+  if (tagged) return downloadUrl(identifier, tagged.name);
+  const named = files.find((f) => f.name && IMAGE_EXT.test(f.name) && /cover|front|folder/i.test(f.name));
+  if (named) return downloadUrl(identifier, named.name);
+  return undefined;
 }
 
 function downloadUrl(identifier, filename) {
@@ -398,16 +396,17 @@ function findPairedVideo(files, baseKey) {
 
 function buildTrackFromGroup(identifier, group, meta, includeVideo, allFiles) {
   const file = group.file;
+  const artworkURL = resolveArtwork(identifier, allFiles);
   const track = {
     id: b64urlEncode({ i: identifier, f: file.name }),
     title: fileTitle(file),
     artist: creatorName(meta),
     album: cleanText(meta?.metadata?.title || identifier, 90),
     duration: bestDurationForGroup(group),
-    artworkURL: resolveArtwork(identifier, allFiles),
     format: mapFormatField(file),
     streamURL: downloadUrl(identifier, file.name),
   };
+  if (artworkURL) track.artworkURL = artworkURL;
   if (Number.isInteger(group.trackNumber)) track.trackNumber = group.trackNumber;
   if (includeVideo) {
     const vid = findPairedVideo(allFiles, normalizeBaseName(file.name));
@@ -428,7 +427,7 @@ function manifest(category) {
   return {
     id: `${ADDON_ID}.${category}`,
     name: category === "all" ? ADDON_NAME : `${ADDON_NAME} — ${cat.label}`,
-    version: "5.0.0",
+    version: "6.0.0",
     description: ADDON_DESC,
     icon: ADDON_ICON,
     resources: ["search", "stream", "catalog", "settings"],
@@ -552,7 +551,6 @@ async function searchHandler(u, category) {
     id: d.identifier,
     title: cleanText(d.title || d.identifier, 80),
     artist: cleanText(Array.isArray(d.creator) ? d.creator.join(", ") : d.creator || "Unknown", 60),
-    artworkURL: albumArtwork(d.identifier),
     year: (d.date || "").slice(0, 4) || undefined,
   }));
 
@@ -598,37 +596,32 @@ async function albumHandler(identifier, u) {
     return jsonResp({
       fileCount: meta.files.length,
       groupCount: groups.length,
-      resolvedArtwork: resolveArtwork(identifier, meta.files),
-      groups: groups.slice(0, 40).map((g) => ({
+      resolvedArtwork: resolveArtwork(identifier, meta.files) || null,
+      groups: groups.map((g) => ({
         file: g.file.name,
         format: g.file.format,
+        mappedFormat: mapFormatField(g.file),
         score: g.score,
         trackNumber: g.trackNumber,
         chosenDuration: bestDurationForGroup(g),
-        rawFileLength: g.file.length,
-        memberFiles: g.members.map((m) => ({ name: m.name, format: m.format })),
+        memberFiles: g.members.map((m) => ({ name: m.name, format: m.format, track: m.track })),
       })),
     }, 200, 0);
   }
 
-  const totalTracks = groups.length;
-  const limitedGroups = groups.slice(0, ALBUM_TRACK_LIMIT);
-  const tracks = limitedGroups.map((g) => buildTrackFromGroup(identifier, g, meta, includeVideo, meta.files));
+  const tracks = groups.map((g) => buildTrackFromGroup(identifier, g, meta, includeVideo, meta.files));
+  const artworkURL = resolveArtwork(identifier, meta.files);
 
   const result = {
     id: identifier,
     title: cleanText(meta.metadata?.title || identifier, 80),
     artist: creatorName(meta),
-    artworkURL: resolveArtwork(identifier, meta.files),
     year: (meta.metadata?.date || "").slice(0, 4) || undefined,
     description: meta.metadata?.description ? cleanText(stripHtml(meta.metadata.description), 250) : undefined,
-    trackCount: totalTracks,
+    trackCount: tracks.length,
     tracks,
   };
-  if (totalTracks > ALBUM_TRACK_LIMIT) {
-    result.truncated = true;
-    result.totalTracks = totalTracks;
-  }
+  if (artworkURL) result.artworkURL = artworkURL;
   return jsonResp(result, 200, 300);
 }
 
@@ -653,26 +646,26 @@ async function artistHandler(idParam, u) {
     id: d.identifier,
     title: cleanText(d.title || d.identifier, 80),
     artist: cleanText(creator, 60),
-    artworkURL: albumArtwork(d.identifier),
     year: (d.date || "").slice(0, 4) || undefined,
   }));
 
   const topDocs = docs.slice(0, ARTIST_TOP_TRACK_ITEMS);
   const metas = await Promise.all(topDocs.map((d) => archiveMetadata(d.identifier, METADATA_TIMEOUT_FAST_MS)));
   const topTracks = [];
+  let artistArtwork;
   metas.forEach((meta, idx) => {
     if (!meta || !Array.isArray(meta.files)) return;
+    if (!artistArtwork) {
+      const found = resolveArtwork(topDocs[idx].identifier, meta.files);
+      if (found) artistArtwork = found;
+    }
     const groups = groupAudioFiles(meta.files, preferLossless).slice(0, 3);
     for (const g of groups) topTracks.push(buildTrackFromGroup(topDocs[idx].identifier, g, meta, includeVideo, meta.files));
   });
 
-  return jsonResp({
-    id: idParam,
-    name: cleanText(creator, 60),
-    artworkURL: docs[0] ? albumArtwork(docs[0].identifier) : undefined,
-    topTracks,
-    albums,
-  }, 200, 300);
+  const result = { id: idParam, name: cleanText(creator, 60), topTracks, albums };
+  if (artistArtwork) result.artworkURL = artistArtwork;
+  return jsonResp(result, 200, 300);
 }
 
 async function playlistHandler(identifier, u) {
@@ -691,15 +684,17 @@ async function playlistHandler(identifier, u) {
   });
 
   const cName = collectionMeta ? creatorName(collectionMeta) : "Unknown";
+  const artworkURL = collectionMeta ? resolveArtwork(identifier, collectionMeta.files) : undefined;
 
-  return jsonResp({
+  const result = {
     id: identifier,
     title: cleanText(collectionMeta?.metadata?.title || identifier, 80),
     description: collectionMeta?.metadata?.description ? cleanText(stripHtml(collectionMeta.metadata.description), 250) : undefined,
-    artworkURL: resolveArtwork(identifier, collectionMeta?.files),
     creator: cName !== "Unknown" ? cName : undefined,
     tracks,
-  }, 200, 300);
+  };
+  if (artworkURL) result.artworkURL = artworkURL;
+  return jsonResp(result, 200, 300);
 }
 
 // ─── Router ──────────────────────────────────────────────────────────────────
