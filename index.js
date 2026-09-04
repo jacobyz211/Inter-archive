@@ -1,49 +1,36 @@
 /**
  * Internet Archive Addon — Cloudflare Worker (for Eclipse Music)
  *
- * v4 — ARTWORK, ARTIST MATCHING, QUALITY DISPLAY, DURATION FIXES:
- * - FIXED "albums don't show any cover now": v3 went too far — it turns
- *   out archive.org's /services/img/{id} endpoint is NOT a generic
- *   placeholder for most items; it only falls back to a generic icon
- *   when an item genuinely has zero image assets (confirmed: it's their
- *   real auto-extracted thumbnail service). Reintroduced it as the
- *   fallback artwork source everywhere, while still preferring a real
- *   per-item cover file (tagged "Item Tile"/"Item Image"/"Thumbnail", or
- *   named cover/front/folder) when full metadata is already available.
- * - Artist pages now also get artwork: uses the top matching album's
- *   resolved cover as a stand-in artist image (archive.org has no
- *   dedicated artist images, so this is the best available signal).
- * - FIXED "Future" showing "Odd Future" instead, and no Future artist
- *   entry at all: creator:("query") is a Lucene PHRASE match, which
- *   matches any creator field containing that word anywhere — "Odd
- *   Future" contains the token "future" and was outranking/hiding the
- *   real match. Search now ranks creators whose field is an EXACT
- *   case-insensitive match to the query ahead of ones that merely
- *   contain it, and always guarantees an artist entry for the literal
- *   query text even when no item has proper creator metadata (common on
- *   informally-uploaded mixtapes that only name the artist in the
- *   title). Artist pages now also search by title, not just creator, to
- *   pull in albums that lack proper creator tags.
- * - FIXED "quality shows mp3 or nothing": Eclipse's documented track
- *   format enum is only mp3/flac/aac/m4a — WAV and Ogg Vorbis aren't in
- *   it, so tracks in those formats had no recognized value for Eclipse's
- *   quality badge to render. WAV now reports as "flac" (both lossless)
- *   and Ogg as "aac" (both lossy) for display purposes — the actual
- *   streamURL is unchanged and still points at the real file.
- * - FIXED wrong duration on specific tracks (plays fine, but shows the
- *   wrong total time and seeking misbehaves): some archive.org items
- *   have a source file (often the lossless master) whose `length`
- *   metadata was inherited from a merged/joined recording rather than
- *   the individual split track, while the per-track MP3 derivative of
- *   the same recording has the correct length. Duration now prefers an
- *   MP3 sibling's length value when one exists in the same track group,
- *   falling back to the chosen file's own length, then 0.
- *
- * ── Mapping onto archive.org ─────────────────────────────────────────────
- * - "album" -> an archive.org item. "track" -> an audio file inside it.
- * - "artist" -> the `creator` metadata field (best-effort).
- * - "playlist" -> an archive.org "collection".
- * streamURL is always a direct, permanent archive.org download link.
+ * v5 — ARTWORK SIZE, HUGE-ITEM PAGINATION, FLAC/MP3 GROUPING FIX:
+ * - FIXED covers rendering huge/off-screen again: archive.org's
+ *   /services/img/{id} endpoint does NOT always serve a proper small
+ *   thumbnail — for any item that never had a derived thumbnail
+ *   generated, it serves the ORIGINAL SOURCE IMAGE directly, which can
+ *   be a multi-megapixel raw scan. Every artwork URL now requests an
+ *   explicit `?w=500` (archive.org honors width-constrained thumbnail
+ *   requests), so even un-derived items get a bounded-size image instead
+ *   of whatever raw file happens to be attached.
+ * - FIXED "some albums not loading" / "artist pages huge, completely off
+ *   screen": some archive.org items (78rpm compilations, old-time radio
+ *   box sets, etc.) contain hundreds to thousands of audio files. album/
+ *   artist/playlist responses are now capped at a sane max track count
+ *   (ALBUM_TRACK_LIMIT) with a `truncated`/`totalTracks` hint, instead of
+ *   returning every single file — that's what was producing enormous
+ *   payloads that either timed out entirely or rendered as absurdly long
+ *   pages.
+ * - FIXED "quality only ever shows mp3, never flac": the file-grouping
+ *   logic that merges different renditions of the same track (so the
+ *   best format wins) was comparing cleaned filenames directly, but
+ *   archive.org's auto-derived MP3s commonly append a bitrate/encoding
+ *   suffix the source file doesn't have (e.g. "trackname.flac" vs
+ *   "trackname_vbr.mp3" or "trackname_64kb.mp3") — that suffix made them
+ *   normalize to DIFFERENT keys, so the FLAC and MP3 were never actually
+ *   compared against each other for the same logical track, and
+ *   whichever one simply appeared "good enough" on its own could end up
+ *   picked. normalizeBaseName now also strips common bitrate/encoding
+ *   suffixes (_64kb, _vbr, _128kbps, etc.) before grouping, so FLAC vs
+ *   MP3 renditions of the same recording are correctly recognized as
+ *   the same track and the real winner is chosen by score.
  */
 
 // ─── Config ─────────────────────────────────────────────────────────────────
@@ -56,6 +43,7 @@ const ARCHIVE_SEARCH_URL = "https://archive.org/advancedsearch.php";
 const ARCHIVE_METADATA_URL = "https://archive.org/metadata";
 const ARCHIVE_DOWNLOAD_URL = "https://archive.org/download";
 const ARCHIVE_THUMB_URL = "https://archive.org/services/img";
+const THUMB_WIDTH = 500; // v5: bounds archive.org's thumbnail service to a sane size
 
 const METADATA_TIMEOUT_FULL_MS = 15000;
 const METADATA_TIMEOUT_FAST_MS = 4000;
@@ -68,6 +56,7 @@ const ARTIST_TOP_TRACK_ITEMS = 5;
 const ARTIST_ALBUM_LIMIT = 24;
 const PLAYLIST_MAX_ITEMS = 30;
 const PLAYLIST_CONCURRENCY = 6;
+const ALBUM_TRACK_LIMIT = 150; // v5: caps huge multi-hundred-file items from blowing out album pages
 
 const METADATA_CACHE_TTL_MS = 10 * 60 * 1000;
 const metadataCache = new Map();
@@ -207,10 +196,6 @@ function boostExactMatches(docs, query) {
   return [...strong, ...rest];
 }
 
-// v4: creator:("query") is a phrase match against a tokenized field, so
-// "Future" matches "Odd Future" too (it contains the token "future").
-// This ranks creators whose field is an EXACT match to the query first,
-// then ones that merely contain it as a substring/word.
 function buildArtistList(docs, rawQuery, limit) {
   const q = rawQuery.trim().toLowerCase();
   const exact = new Map();
@@ -226,9 +211,6 @@ function buildArtistList(docs, rawQuery, limit) {
     }
   }
   const orderedNames = [...exact.keys(), ...partial.keys()];
-  // v4: guarantee the literal searched name shows up as an artist entry
-  // even when no item has proper creator metadata for it — common for
-  // informally-uploaded mixtapes that only name the artist in the title.
   const hasCloseMatch = orderedNames.some((n) => n.toLowerCase() === q);
   const finalNames = hasCloseMatch ? orderedNames : [rawQuery.trim(), ...orderedNames];
   const artworkFor = (name) => (exact.get(name) || partial.get(name) || docs[0]);
@@ -282,11 +264,6 @@ function formatScore(file, preferLossless) {
   return 10;
 }
 
-// v4: WAV and Ogg Vorbis aren't in Eclipse's documented format enum
-// (mp3/flac/aac/m4a) — reporting them as their nearest official
-// equivalent (WAV->flac, Ogg->aac) gives Eclipse's quality badge a
-// recognized value to render. streamURL is unaffected; the real file
-// served is unchanged.
 function mapFormatField(file) {
   const f = (file.format || "").toLowerCase();
   const name = (file.name || "").toLowerCase();
@@ -298,9 +275,23 @@ function mapFormatField(file) {
   return "mp3";
 }
 
+// v5: FIXED the actual grouping bug. archive.org's auto-derived MP3s
+// commonly carry a bitrate/encoding suffix the lossless source doesn't
+// have (e.g. "song.flac" vs "song_vbr.mp3" or "song_64kb.mp3"). Those
+// suffixes now get stripped BEFORE the extension/punctuation cleanup, so
+// both renditions normalize to the same key and actually get compared
+// against each other for best format — previously they silently became
+// two unrelated "tracks" and the real FLAC could lose out or never even
+// be seen as an alternative to the MP3.
+const RENDITION_SUFFIX_RE = /[_\-\s]?(64kb?ps?|128kb?ps?|192kb?ps?|256kb?ps?|320kb?ps?|vbr|64k|128k|192k|256k|320k)$/i;
 function normalizeBaseName(filename) {
-  return String(filename || "")
-    .replace(/\.[a-z0-9]{2,5}$/i, "")
+  let base = String(filename || "").replace(/\.[a-z0-9]{2,5}$/i, "");
+  let prev;
+  do {
+    prev = base;
+    base = base.replace(RENDITION_SUFFIX_RE, "");
+  } while (base !== prev);
+  return base
     .replace(/[_\-.]+/g, " ")
     .replace(/\s+/g, " ")
     .trim()
@@ -328,12 +319,6 @@ function parseDurationSeconds(file) {
   return undefined;
 }
 
-// v4: some archive.org items have a source/master file whose `length`
-// metadata was inherited from a merged/joined recording rather than the
-// actual split track, while the auto-generated per-track MP3 derivative
-// of the SAME recording usually has the correct individual length. Prefer
-// that sibling's duration when available, regardless of which file is
-// actually streamed.
 function bestDurationForGroup(group) {
   const mp3Sibling = group.members?.find((f) => /mp3/i.test(f.format || "") && f.length);
   return parseDurationSeconds(mp3Sibling) ?? parseDurationSeconds(group.file) ?? 0;
@@ -353,9 +338,6 @@ function fileTitle(file) {
   return cleanText(cleaned, 90);
 }
 
-// v4: keeps every rendition (`members`) of a logical track alongside the
-// chosen best-quality one, so duration/other metadata can be cross-
-// checked against a more reliable sibling file when needed.
 function groupAudioFiles(files, preferLossless) {
   const audioFiles = (files || []).filter(isAudioFile);
   const groups = new Map();
@@ -391,13 +373,11 @@ function creatorName(meta) {
   return cleanText(names.join(", "), 60);
 }
 
-// v4: archive.org's own thumbnail service reintroduced as the universal
-// fallback (it's a real auto-extracted image for most items, not a
-// generic placeholder — that only shows for items with zero image
-// assets). Still prefers a genuine per-item cover file when metadata is
-// already available.
+// v5: width-constrained thumbnail request — bounds archive.org's
+// fallback-to-original-image behavior for items with no derived
+// thumbnail, which is what was rendering as huge/off-screen covers.
 function albumArtwork(identifier) {
-  return `${ARCHIVE_THUMB_URL}/${encodeURIComponent(identifier)}`;
+  return `${ARCHIVE_THUMB_URL}/${encodeURIComponent(identifier)}?w=${THUMB_WIDTH}`;
 }
 function resolveArtwork(identifier, files) {
   if (Array.isArray(files)) {
@@ -448,7 +428,7 @@ function manifest(category) {
   return {
     id: `${ADDON_ID}.${category}`,
     name: category === "all" ? ADDON_NAME : `${ADDON_NAME} — ${cat.label}`,
-    version: "4.0.0",
+    version: "5.0.0",
     description: ADDON_DESC,
     icon: ADDON_ICON,
     resources: ["search", "stream", "catalog", "settings"],
@@ -619,30 +599,37 @@ async function albumHandler(identifier, u) {
       fileCount: meta.files.length,
       groupCount: groups.length,
       resolvedArtwork: resolveArtwork(identifier, meta.files),
-      groups: groups.map((g) => ({
+      groups: groups.slice(0, 40).map((g) => ({
         file: g.file.name,
         format: g.file.format,
         score: g.score,
         trackNumber: g.trackNumber,
         chosenDuration: bestDurationForGroup(g),
         rawFileLength: g.file.length,
-        memberCount: g.members.length,
+        memberFiles: g.members.map((m) => ({ name: m.name, format: m.format })),
       })),
     }, 200, 0);
   }
 
-  const tracks = groups.map((g) => buildTrackFromGroup(identifier, g, meta, includeVideo, meta.files));
+  const totalTracks = groups.length;
+  const limitedGroups = groups.slice(0, ALBUM_TRACK_LIMIT);
+  const tracks = limitedGroups.map((g) => buildTrackFromGroup(identifier, g, meta, includeVideo, meta.files));
 
-  return jsonResp({
+  const result = {
     id: identifier,
     title: cleanText(meta.metadata?.title || identifier, 80),
     artist: creatorName(meta),
     artworkURL: resolveArtwork(identifier, meta.files),
     year: (meta.metadata?.date || "").slice(0, 4) || undefined,
     description: meta.metadata?.description ? cleanText(stripHtml(meta.metadata.description), 250) : undefined,
-    trackCount: tracks.length,
+    trackCount: totalTracks,
     tracks,
-  }, 200, 300);
+  };
+  if (totalTracks > ALBUM_TRACK_LIMIT) {
+    result.truncated = true;
+    result.totalTracks = totalTracks;
+  }
+  return jsonResp(result, 200, 300);
 }
 
 async function artistHandler(idParam, u) {
@@ -656,8 +643,6 @@ async function artistHandler(idParam, u) {
   const includeVideo = u.searchParams.get("includeVideo") === "true";
   const lucC = luceneEscape(creator);
 
-  // v4: also search by title, not just creator — many informally-
-  // uploaded mixtapes/albums only name the artist in the title.
   const [creatorDocsRaw, titleDocsRaw] = await Promise.all([
     archiveSearch({ q: `creator:("${lucC}") AND mediatype:(audio)`, rows: ARTIST_ALBUM_LIMIT, sort: "downloads desc" }),
     archiveSearch({ q: `title:("${lucC}") AND mediatype:(audio)`, rows: ARTIST_ALBUM_LIMIT, sort: "downloads desc" }),
