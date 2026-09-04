@@ -1,58 +1,47 @@
 /**
  * Internet Archive Addon — Cloudflare Worker (for Eclipse Music)
  *
- * v7 — FINAL: real search relevance, real artist matching, real quality
- * display.
+ * v8 — FINAL: query-term AND-forcing, wider artist coverage.
  *
- * - FIXED quality/format never showing beyond a bare mp3 label: Eclipse's
- *   docs are explicit — the descriptive `quality` text field ("lossless",
- *   "320kbps", etc.) ONLY exists in the /stream/{id} RESPONSE. Eclipse
- *   only calls /stream when a track has no `streamURL` on it already.
- *   Every track here has always carried a direct streamURL (so saved/
- *   offline tracks keep working), which meant Eclipse was silently
- *   SKIPPING /stream and never seeing quality info at all — no amount of
- *   fixing the FLAC-selection logic could have shown it, because the
- *   field that carries it was never being requested. FIX: streamURL is
- *   removed from track objects entirely. Eclipse now always calls
- *   /stream/{id} to play, and that response returns a real, descriptive
- *   `quality` string (e.g. "FLAC (Lossless)", "24-bit FLAC (Lossless)",
- *   "VBR MP3", "128kbps MP3") built directly from the file's own
- *   archive.org format string — plus the correct `format` enum value.
- *   All the info /stream needs is embedded directly in the track's id
- *   (identifier + filename + precomputed format/quality), so this adds
- *   no extra archive.org request — /stream responds instantly.
- * - FIXED "searching 'evol future' only shows a hollow artist with
- *   nothing in it, doesn't show the real Evol album by Future": the
- *   query was matching an exact PHRASE against ONE field at a time
- *   (title:("evol future") or creator:("evol future")) — but real items
- *   split the words across fields (title "Evol", creator "Future"), so
- *   neither field ever contained the literal phrase and nothing matched.
- *   Search's primary results now use an UNSCOPED query — the same kind
- *   of plain relevance search archive.org's own search bar performs —
- *   so a query like "evol future" naturally surfaces the real "Evol
- *   (FLAC) by Future" item, exactly like the screenshot. The old
- *   "guarantee a placeholder artist" fallback (the actual source of the
- *   hollow "Evol Future" artist with nothing in it) is removed entirely
- *   — artists are only ever built from real creator metadata that
- *   actually exists in the results.
- * - FIXED "Future" pulling in Odd Future / Future D. tracks on both the
- *   search page AND his artist page: creator:("query") is a tokenized
- *   phrase match, so it matches ANY creator field containing that word,
- *   which is why "Odd Future" and "Future D." kept polluting results
- *   even after exact-match ranking (ranking just reordered the noise, it
- *   didn't remove it — and the artist PAGE itself re-ran the same loose
- *   query with no filtering at all). Artist-scoped queries (both the
- *   search page's artist list AND clicking into an artist page) now
- *   FILTER results to items whose creator field, split on common
- *   multi-artist delimiters, contains a token that's an EXACT
- *   case-insensitive match to the artist name — not just a substring
- *   match — so "Future" no longer pulls in "Odd Future" or "Future D."
- *   on either the search results or the dedicated artist page.
+ * - FIXED completely unrelated search results ("time pink floyd" showing
+ *   random podcasts with zero connection to Pink Floyd): archive.org's
+ *   search backend does NOT automatically require every space-separated
+ *   word to be present when the query is combined with an explicit
+ *   `AND mediatype:(audio)` clause — the parser's default term
+ *   combination behaves closer to OR once mixed with an explicit AND,
+ *   so a query like "(time pink floyd) AND mediatype:(audio)" could
+ *   match ANY item containing just the single extremely common word
+ *   "time" ANYWHERE in its metadata, with zero requirement that "pink"
+ *   or "floyd" appear at all. That's exactly why a "Blackout Podcast"
+ *   with no relation to Pink Floyd outranked real Pink Floyd albums.
+ *   FIX: every individual word in the query is now explicitly escaped
+ *   and joined with real AND operators (buildRequiredTermsQuery), so
+ *   ALL words must be present somewhere in the item — matching how
+ *   users actually expect multi-word search to behave, and matching
+ *   archive.org's own search-bar results for the same query.
+ * - Re-added exact-title/creator-match boosting on top of the properly
+ *   AND-scoped results, so items with the query terms appearing together
+ *   in the title still rank above ones where the terms are merely
+ *   scattered across different metadata fields.
+ * - FIXED artist pages/search sometimes only showing "a little" of an
+ *   artist's real catalog: the creator-scoped candidate pool fetched
+ *   before exact-match filtering was too small (80 rows sorted by
+ *   downloads) — a real album with modest downloads could simply never
+ *   make it into that top-80 pool before filtering even ran. Raised to
+ *   200 rows for the artist detail page and 60 for the search page's
+ *   creator lookup, so filtering has a much larger, more complete pool
+ *   to draw from before narrowing to exact matches.
  *
- * ── Mapping onto archive.org ─────────────────────────────────────────────
- * - "album" -> an archive.org item. "track" -> an audio file inside it.
- * - "artist" -> the `creator` metadata field.
- * - "playlist" -> an archive.org "collection".
+ * ── Carried over from v7 (unchanged) ──────────────────────────────────────
+ * - streamURL removed from track objects; /stream/{id} always returns a
+ *   real `quality` string + correct `format`, computed at track-build
+ *   time and embedded in the track id (no extra archive.org round-trip).
+ * - Artist matching requires an EXACT token match (splitting multi-artist
+ *   creator strings) — not substring — so "Future" never pulls in "Odd
+ *   Future" or "Future D."
+ * - Artwork: real per-item cover file only, omitted when none exists (no
+ *   generic thumbnail-service fallback).
+ * - No track-count cap on albums/artists/playlists.
  */
 
 // ─── Config ─────────────────────────────────────────────────────────────────
@@ -72,8 +61,10 @@ const SEARCH_TIMEOUT_MS = 6000;
 const SEARCH_ENRICH_COUNT = 4;
 const SEARCH_ALBUM_LIMIT = 20;
 const SEARCH_ARTIST_LIMIT = 8;
+const SEARCH_CREATOR_ROWS = 60; // v8: was 20 — wider pool before exact-match filtering
 const ARTIST_TOP_TRACK_ITEMS = 5;
 const ARTIST_ALBUM_LIMIT = 24;
+const ARTIST_CREATOR_ROWS = 200; // v8: was 80 — real low-download albums were getting cut before filtering ran
 const PLAYLIST_MAX_ITEMS = 30;
 const PLAYLIST_CONCURRENCY = 6;
 
@@ -113,6 +104,17 @@ function cleanText(str, maxLen = 80) {
   if (!cleaned) return "";
   if (cleaned.length <= maxLen) return cleaned;
   return cleaned.slice(0, maxLen - 1).trim() + "…";
+}
+
+// v8: THE core search fix. Splits the user's query into individual words
+// and joins them with explicit AND operators (each word quoted/escaped),
+// so archive.org's search requires EVERY word to be present somewhere in
+// the item — instead of the loose, near-OR behavior that let a single
+// common word like "time" match totally unrelated items.
+function buildRequiredTermsQuery(query) {
+  const words = String(query || "").trim().split(/\s+/).filter(Boolean);
+  if (!words.length) return "";
+  return words.map((w) => `"${luceneEscape(w)}"`).join(" AND ");
 }
 
 function b64urlEncode(obj) {
@@ -156,11 +158,6 @@ async function mapWithConcurrency(items, limit, fn) {
 }
 
 // ─── Artist name matching ───────────────────────────────────────────────────
-// v7: creator fields are sometimes multi-artist strings ("Future & Drake",
-// "Future; Metro Boomin", "Future feat. Drake"). Splitting on common
-// delimiters and requiring an EXACT token match (not substring) is what
-// stops "Future" from matching "Odd Future" or "Future D." — a substring
-// check would still let those through.
 function splitCreatorTokens(name) {
   return String(name || "")
     .split(/[;,&/]| feat\.?| featuring | x | with /i)
@@ -176,6 +173,20 @@ function creatorFieldMatchesExactly(creatorField, targetLower) {
     }
   }
   return false;
+}
+
+function boostExactMatches(docs, query) {
+  const q = String(query || "").trim().toLowerCase();
+  if (!q) return docs;
+  const strong = [];
+  const rest = [];
+  for (const d of docs) {
+    const title = (d.title || "").toLowerCase();
+    const creators = Array.isArray(d.creator) ? d.creator.join(" ").toLowerCase() : (d.creator || "").toLowerCase();
+    if (title.includes(q) || creators.includes(q)) strong.push(d);
+    else rest.push(d);
+  }
+  return [...strong, ...rest];
 }
 
 // ─── archive.org API calls ──────────────────────────────────────────────────
@@ -267,9 +278,6 @@ function formatScore(file, preferLossless) {
   return 10;
 }
 
-// Eclipse's `format` enum is exactly mp3/flac/aac/m4a — WAV and Ogg
-// Vorbis aren't in it, so they're mapped to their nearest lossless/lossy
-// equivalent for display (the actual streamed file is unaffected).
 function mapFormatField(file) {
   const f = (file.format || "").toLowerCase();
   const name = (file.name || "").toLowerCase();
@@ -281,9 +289,6 @@ function mapFormatField(file) {
   return "mp3";
 }
 
-// v7: builds the descriptive quality string that only ever reaches
-// Eclipse via the /stream response's `quality` field — this is the piece
-// that was never being seen at all while tracks carried a streamURL.
 function qualityLabelForFile(file) {
   const raw = (file.format || "").trim();
   const f = raw.toLowerCase();
@@ -324,10 +329,6 @@ function parseTrackNumber(file) {
   if (m) return parseInt(m[1], 10);
   return null;
 }
-
-// Groups by track-number metadata first (consistent across renditions of
-// the same track regardless of filename scheme), falls back to filename
-// normalization only when no track number exists at all.
 function groupKeyForFile(file) {
   const tn = parseTrackNumber(file);
   if (tn != null) return `#${tn}`;
@@ -344,7 +345,6 @@ function parseDurationSeconds(file) {
   if (parts.length === 2) return parts[0] * 60 + parts[1];
   return undefined;
 }
-
 function bestDurationForGroup(group) {
   const mp3Sibling = group.members?.find((f) => /mp3/i.test(f.format || "") && f.length);
   return parseDurationSeconds(mp3Sibling) ?? parseDurationSeconds(group.file) ?? 0;
@@ -364,9 +364,6 @@ function fileTitle(file) {
   return cleanText(cleaned, 90);
 }
 
-// Groups renditions of the same track by track-number, keeps every
-// member, and hard-guarantees a lossless pick whenever one genuinely
-// exists in the group and preferLossless is on.
 function groupAudioFiles(files, preferLossless) {
   const audioFiles = (files || []).filter(isAudioFile);
   const groups = new Map();
@@ -408,8 +405,6 @@ function creatorName(meta) {
   return cleanText(names.join(", "), 60);
 }
 
-// Real per-item cover file only — no generic thumbnail-service fallback,
-// omitted entirely when no real cover exists (per explicit request).
 function resolveArtwork(identifier, files) {
   if (!Array.isArray(files)) return undefined;
   const tagged = files.find((f) => f.name && IMAGE_EXT.test(f.name) && /item tile|item image|thumbnail/i.test(f.format || ""));
@@ -426,11 +421,6 @@ function findPairedVideo(files, baseKey) {
   return (files || []).find((f) => VIDEO_EXT.test(f.name || "") && normalizeBaseName(f.name) === baseKey) || null;
 }
 
-// v7: id now carries everything /stream needs (identifier, filename,
-// precomputed format + quality label) so /stream can respond instantly
-// without a second archive.org round-trip. streamURL is intentionally
-// NOT included — this is what makes Eclipse actually call /stream and
-// see the quality info instead of skipping straight to playback.
 function buildTrackFromGroup(identifier, group, meta, includeVideo, allFiles) {
   const file = group.file;
   const artworkURL = resolveArtwork(identifier, allFiles);
@@ -465,7 +455,7 @@ function manifest(category) {
   return {
     id: `${ADDON_ID}.${category}`,
     name: category === "all" ? ADDON_NAME : `${ADDON_NAME} — ${cat.label}`,
-    version: "7.0.0",
+    version: "8.0.0",
     description: ADDON_DESC,
     icon: ADDON_ICON,
     resources: ["search", "stream", "catalog", "settings"],
@@ -565,13 +555,6 @@ async function generateHandler(u, base) {
   return jsonResp({ category, token, manifestUrl: `${base}/${slug}/manifest.json` });
 }
 
-// v7: primary results now come from an UNSCOPED query — plain relevance
-// search across the whole item, mirroring archive.org's own search bar
-// — instead of restrictive per-field phrase matching that silently
-// matched nothing when a query's words were split across fields (title
-// vs creator). A separate, STRICTLY creator-filtered query still runs in
-// parallel purely to power the artist list, so distinct-artist lookups
-// stay accurate without polluting or replacing the main relevance results.
 async function searchHandler(u, category) {
   const q = (u.searchParams.get("q") || "").trim();
   if (!q) return jsonResp({ tracks: [], albums: [], artists: [], playlists: [] }, 200, 60);
@@ -582,13 +565,17 @@ async function searchHandler(u, category) {
   const catFilter = catDef.collectionFilter ? ` AND ${catDef.collectionFilter}` : "";
   const lucQ = luceneEscape(q);
 
-  const relevanceQuery = `(${lucQ}) AND mediatype:(audio)${catFilter}`;
+  // v8: relevanceQuery now requires EVERY word to be present (see
+  // buildRequiredTermsQuery) — this is the actual search-quality fix.
+  const requiredTerms = buildRequiredTermsQuery(q);
+  const relevanceQuery = `(${requiredTerms}) AND mediatype:(audio)${catFilter}`;
   const creatorQuery = `creator:("${lucQ}") AND mediatype:(audio)${catFilter}`;
 
-  const [relevanceDocs, creatorDocsRaw] = await Promise.all([
-    archiveSearch({ q: relevanceQuery, rows: 24, sort: null }),
-    archiveSearch({ q: creatorQuery, rows: 20, sort: "downloads desc" }),
+  const [relevanceDocsRaw, creatorDocsRaw] = await Promise.all([
+    archiveSearch({ q: relevanceQuery, rows: 30, sort: null }),
+    archiveSearch({ q: creatorQuery, rows: SEARCH_CREATOR_ROWS, sort: "downloads desc" }),
   ]);
+  const relevanceDocs = boostExactMatches(relevanceDocsRaw, q);
 
   const qLower = q.toLowerCase();
   const creatorDocs = creatorDocsRaw.filter((d) => creatorFieldMatchesExactly(d.creator, qLower));
@@ -611,8 +598,6 @@ async function searchHandler(u, category) {
     for (const g of groups) tracks.push(buildTrackFromGroup(topDocs[idx].identifier, g, meta, includeVideo, meta.files));
   });
 
-  // Artists list built ONLY from real, exact-matching creator metadata —
-  // no synthetic/placeholder entries when nothing genuinely matches.
   const artistMap = new Map();
   for (const d of creatorDocs) {
     const names = Array.isArray(d.creator) ? d.creator : d.creator ? [d.creator] : [];
@@ -630,8 +615,6 @@ async function searchHandler(u, category) {
   return jsonResp({ tracks, albums, artists, playlists: [] }, 200, 120);
 }
 
-// v7: id now embeds precomputed format/quality — no archive.org
-// round-trip needed, /stream responds immediately.
 async function streamHandler(idParam) {
   let identifier, filename, format, quality;
   try {
@@ -692,9 +675,6 @@ async function albumHandler(identifier, u) {
   return jsonResp(result, 200, 300);
 }
 
-// v7: strictly filters to items whose creator field contains an EXACT
-// match to the artist name — this is what stops "Future"'s page from
-// being flooded with "Odd Future" / "Future D." items.
 async function artistHandler(idParam, u) {
   let creator;
   try {
@@ -707,7 +687,7 @@ async function artistHandler(idParam, u) {
   const lucC = luceneEscape(creator);
   const creatorLower = creator.trim().toLowerCase();
 
-  const rawDocs = await archiveSearch({ q: `creator:("${lucC}") AND mediatype:(audio)`, rows: 80, sort: "downloads desc" });
+  const rawDocs = await archiveSearch({ q: `creator:("${lucC}") AND mediatype:(audio)`, rows: ARTIST_CREATOR_ROWS, sort: "downloads desc" });
   const docs = rawDocs.filter((d) => creatorFieldMatchesExactly(d.creator, creatorLower)).slice(0, ARTIST_ALBUM_LIMIT);
 
   const albums = docs.map((d) => ({
