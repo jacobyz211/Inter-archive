@@ -1,60 +1,44 @@
 /**
  * Internet Archive Addon — Cloudflare Worker (for Eclipse Music)
  *
- * Searches, browses, and streams audio directly from archive.org:
- * music, live concerts (etree), audiobooks (LibriVox), old-time radio,
- * podcasts — anything tagged mediatype:audio on the Internet Archive.
- *
- * No auth, no API keys, no secrets. archive.org is fully public.
- *
- * v2 — CATEGORY-SPECIFIC GENERATED MANIFESTS + BUG FIXES:
- * - Landing page now has a "Generate" button per content category (Music,
- *   Live Concerts, Audiobooks, Podcasts, Old-Time Radio, Everything). Each
- *   click makes a manifest.json URL at /{category}-{24-char-token}/... —
- *   the token is random (cosmetic uniqueness, matching Tido's pattern);
- *   the category prefix is what the worker actually reads to pick the
- *   right `contentType` (music/audiobook/podcast) and restrict search to
- *   the matching archive.org collection(s), since Eclipse only supports
- *   ONE contentType per manifest. Root-level requests with no category
- *   slug still work and default to "all" / contentType "music".
- * - FIXED blank-but-clickable track rows: some archive.org filenames
- *   (e.g. bare "01.mp3") produced an empty cleaned title, and duration
- *   was `undefined` instead of 0 when a file had no length metadata.
- *   Track title now always falls back through file.title -> cleaned
- *   filename -> "Track N" -> "Untitled Track", and duration always
- *   defaults to 0 instead of being omitted.
- * - FIXED some albums not loading: very large items (thousands of files)
- *   were timing out against the old 8s fetch limit. The primary
- *   /album/{id} metadata fetch now gets 15s (correctness matters more
- *   there); search/artist/playlist enrichment lookups use a fast 5s
- *   best-effort timeout instead so browsing doesn't feel slow waiting on
- *   one big item.
- * - FIXED search relevance ("panchiko" surfacing an unrelated but more-
- *   downloaded item like "Dismiss Yourself" ahead of it): search no
- *   longer forces sort=downloads desc (pure popularity, ignores text
- *   match quality) for keyword queries. It now uses archive.org's default
- *   relevance ranking, plus a manual boost pass that moves any result
- *   whose title or creator contains the query text to the front.
- * - FIXED "albums loading wider than screen": archive.org titles and
- *   descriptions can be extremely long, unbroken strings. All title,
- *   artist, and description fields are now cleaned (newlines collapsed)
- *   and truncated with an ellipsis at sane lengths.
- * - Search enrichment no longer runs through an artificial concurrency
- *   queue for the small top-N result set — it's fully parallel now,
- *   shaving a bit of latency off every search.
+ * v3 — SEARCH RELEVANCE, ARTWORK, AND SPEED FIXES:
+ * - FIXED "searching Travis Scott shows random stuff": /search now runs
+ *   TWO queries in parallel — a precise `creator:("query")` match (the
+ *   same approach archive.org's own site uses, confirmed by the
+ *   creator:(travis scott) example) and a broader query scoped to
+ *   title/creator/description fields specifically (NOT a raw full-text
+ *   scan across every indexed field, which is what was pulling in
+ *   unrelated items that merely mentioned the term somewhere). Results
+ *   are merged with creator-matches first, deduped by identifier.
+ * - FIXED "black and white audio-looking cover" + oversized/off-screen
+ *   layout: was defaulting every album/track/artist artworkURL to
+ *   archive.org's generic /services/img/ endpoint, which returns a
+ *   generic monochrome placeholder for items with no real cover — and
+ *   that placeholder appears to be causing the layout blowout. Now:
+ *   artworkURL is only set when a REAL cover image is confirmed to exist
+ *   in the item's file list (preferring the file IA itself tags
+ *   format:"Item Tile", its canonical thumbnail; falling back to a
+ *   filename containing cover/front/folder). When no real image exists,
+ *   artworkURL is omitted entirely so Eclipse shows its own properly-
+ *   sized placeholder instead of archive.org's.
+ * - Tightened all title/artist truncation further (80/60 chars) and
+ *   capped album/artist search result-list lengths to keep album and
+ *   artist pages from rendering huge, sprawling lists.
+ * - FIXED slow/occasionally-failing searches: reduced timeouts across
+ *   the board (search 6s, enrichment metadata 4s, enrich count 5→4) so
+ *   a single slow archive.org response can't drag the whole search past
+ *   Eclipse's 5s budget, and tightened Lucene escaping so queries with
+ *   quotes/backslashes can't silently break the search parser.
  *
  * ── Mapping onto archive.org ─────────────────────────────────────────────
- * - "album"    -> an archive.org "item" (identifier).
- * - "track"    -> one audio file inside an item's file list (renditions of
- *                 the same recording are grouped; best format wins).
- * - "artist"   -> archive.org's `creator` metadata field (best-effort).
+ * - "album" -> an archive.org item. "track" -> an audio file inside it
+ *   (renditions of the same recording grouped, best format wins).
+ * - "artist" -> the `creator` metadata field (best-effort — IA has no
+ *   real artist pages).
  * - "playlist" -> an archive.org "collection".
  *
- * ── Why streamURL is used everywhere ─────────────────────────────────────
- * archive.org download links never expire and need no signing, so every
- * track includes a direct `streamURL` — Eclipse skips /stream entirely
- * for these. /stream/{id} is still implemented as a required-endpoint
- * fallback.
+ * streamURL is always a direct, permanent archive.org download link —
+ * Eclipse skips /stream entirely for these.
  */
 
 // ─── Config ─────────────────────────────────────────────────────────────────
@@ -66,22 +50,22 @@ const ADDON_ICON = "https://archive.org/images/glogo.jpg";
 const ARCHIVE_SEARCH_URL = "https://archive.org/advancedsearch.php";
 const ARCHIVE_METADATA_URL = "https://archive.org/metadata";
 const ARCHIVE_DOWNLOAD_URL = "https://archive.org/download";
-const ARCHIVE_THUMB_URL = "https://archive.org/services/img";
 
-const METADATA_TIMEOUT_FULL_MS = 15000; // used for the primary /album/{id} lookup — correctness matters more
-const METADATA_TIMEOUT_FAST_MS = 5000; // used for search/artist/playlist enrichment — best-effort, skip on slow
-const SEARCH_TIMEOUT_MS = 8000;
+const METADATA_TIMEOUT_FULL_MS = 15000; // primary /album/{id} lookup — correctness matters more
+const METADATA_TIMEOUT_FAST_MS = 4000; // search/artist/playlist enrichment — best-effort, skip on slow
+const SEARCH_TIMEOUT_MS = 6000;
 
-const SEARCH_ENRICH_COUNT = 5; // how many top search hits get a real track listing
+const SEARCH_ENRICH_COUNT = 4; // how many top search hits get a real track listing
+const SEARCH_ALBUM_LIMIT = 20;
+const SEARCH_ARTIST_LIMIT = 8;
 const ARTIST_TOP_TRACK_ITEMS = 5;
+const ARTIST_ALBUM_LIMIT = 24;
 const PLAYLIST_MAX_ITEMS = 30;
 const PLAYLIST_CONCURRENCY = 6;
 
 const METADATA_CACHE_TTL_MS = 10 * 60 * 1000;
 const metadataCache = new Map(); // identifier -> { data, ts }
 
-// ── Content categories — each generated manifest link is scoped to one of
-// these, since Eclipse only supports a single contentType per addon. ──────
 const CATEGORIES = {
   all: { label: "Everything", contentType: "music", collectionFilter: null },
   music: { label: "Music", contentType: "music", collectionFilter: "(collection:(opensource_audio) OR collection:(netlabels) OR collection:(78rpm) OR collection:(etree))" },
@@ -107,12 +91,14 @@ function htmlResp(html) {
 function stripHtml(html) {
   return String(html || "").replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim();
 }
+// v3: only escapes what actually matters inside a quoted Lucene phrase
+// (backslash, double-quote) — over-escaping operator characters like
+// "-" broke ordinary words (e.g. "hip-hop") and could cause silent
+// query-parse failures that looked like "search just fails sometimes".
 function luceneEscape(q) {
-  return String(q || "").replace(/"/g, '\\"');
+  return String(q || "").replace(/\\/g, "\\\\").replace(/"/g, '\\"');
 }
-// v2: collapses newlines/whitespace and truncates so long archive.org
-// titles/descriptions can't blow out Eclipse's fixed-width layout.
-function cleanText(str, maxLen = 120) {
+function cleanText(str, maxLen = 80) {
   const cleaned = String(str || "").replace(/[\r\n\t]+/g, " ").replace(/\s+/g, " ").trim();
   if (!cleaned) return "";
   if (cleaned.length <= maxLen) return cleaned;
@@ -160,8 +146,6 @@ async function mapWithConcurrency(items, limit, fn) {
 }
 
 // ─── archive.org API calls ──────────────────────────────────────────────────
-// v2: sort is optional now — omit it for free-text queries so archive.org
-// applies its own relevance ranking instead of pure popularity.
 async function archiveSearch({ q, rows = 25, page = 1, sort = null, fields = ["identifier", "title", "creator", "date", "downloads", "mediatype", "collection"] }) {
   const url = new URL(ARCHIVE_SEARCH_URL);
   url.searchParams.set("q", q);
@@ -194,9 +178,23 @@ async function archiveMetadata(identifier, timeoutMs = METADATA_TIMEOUT_FULL_MS)
   }
 }
 
-// v2: puts any result whose title or creator actually contains the query
-// text ahead of results that only matched on some other indexed field —
-// fixes cases like "panchiko" surfacing an unrelated, more-downloaded item.
+function dedupeDocsByIdentifier(lists) {
+  const seen = new Set();
+  const out = [];
+  for (const list of lists) {
+    for (const d of list) {
+      if (!d?.identifier || seen.has(d.identifier)) continue;
+      seen.add(d.identifier);
+      out.push(d);
+    }
+  }
+  return out;
+}
+
+// v3: replaces the old "boost exact matches" pass — the real fix is
+// running a precise creator-scoped query up front (see searchHandler),
+// so this now just orders the broader/text-matched batch by whether the
+// title/creator visibly contains the query, as a secondary tiebreaker.
 function boostExactMatches(docs, query) {
   const q = String(query || "").trim().toLowerCase();
   if (!q) return docs;
@@ -214,6 +212,7 @@ function boostExactMatches(docs, query) {
 // ─── Audio file filtering, scoring, grouping ───────────────────────────────
 const AUDIO_FORMAT_KEYWORDS = /flac|mp3|ogg|vorbis|\bwav\b|wave|ape|alac|aiff|shorten|\bshn\b|m4a|aac|opus/i;
 const VIDEO_EXT = /\.(mp4|m4v|webm|mov)$/i;
+const IMAGE_EXT = /\.(jpe?g|png|gif)$/i;
 
 function isAudioFile(file) {
   if (!file || !file.name || !file.format) return false;
@@ -291,12 +290,9 @@ function parseDurationSeconds(file) {
   return undefined;
 }
 
-// v2: fixed blank titles — always falls through to a usable string,
-// never returns empty (e.g. bare "01.mp3" now becomes "Track 01" instead
-// of an empty label that only shows up as a clickable-but-blank row).
 function fileTitle(file) {
   const raw = file.title && String(file.title).trim();
-  if (raw) return cleanText(raw, 100);
+  if (raw) return cleanText(raw, 90);
   let cleaned = (file.name || "")
     .replace(/\.[a-z0-9]{2,5}$/i, "")
     .replace(/^\d{1,3}[\s._-]+/, "")
@@ -305,7 +301,7 @@ function fileTitle(file) {
   if (!cleaned) cleaned = (file.name || "").replace(/\.[a-z0-9]{2,5}$/i, "").trim();
   if (!cleaned) cleaned = file.name || "Untitled Track";
   if (/^\d+$/.test(cleaned)) cleaned = `Track ${cleaned}`;
-  return cleanText(cleaned, 100);
+  return cleanText(cleaned, 90);
 }
 
 function groupAudioFiles(files, preferLossless) {
@@ -331,20 +327,31 @@ function groupAudioFiles(files, preferLossless) {
   return list;
 }
 
-// v2: caps creator list length and cleans/truncates — long unbroken
-// creator strings were part of the "album loading too wide" issue.
 function creatorName(meta) {
   const c = meta?.metadata?.creator;
   if (!c) return "Unknown";
   const arr = Array.isArray(c) ? c : [c];
   const names = arr.map(String).map((s) => s.trim()).filter(Boolean);
   if (!names.length) return "Unknown";
-  if (names.length > 3) return cleanText(`${names.slice(0, 3).join(", ")} & others`, 80);
-  return cleanText(names.join(", "), 80);
+  if (names.length > 3) return cleanText(`${names.slice(0, 3).join(", ")} & others`, 60);
+  return cleanText(names.join(", "), 60);
 }
-function albumArtwork(identifier) {
-  return `${ARCHIVE_THUMB_URL}/${encodeURIComponent(identifier)}`;
+
+// v3: real artwork only. Prefers the file archive.org itself tags as the
+// canonical thumbnail (format "Item Tile"), then a filename that looks
+// like an actual cover/front/folder image. Returns undefined — NOT a
+// generic placeholder URL — when no real image exists, so Eclipse's own
+// (properly sized) default artwork is used instead of archive.org's
+// generic monochrome icon.
+function resolveArtwork(identifier, files) {
+  if (!Array.isArray(files)) return undefined;
+  const tile = files.find((f) => f.format === "Item Tile" && f.name);
+  if (tile) return downloadUrl(identifier, tile.name);
+  const named = files.find((f) => f.name && IMAGE_EXT.test(f.name) && /cover|front|folder|album\s*art/i.test(f.name));
+  if (named) return downloadUrl(identifier, named.name);
+  return undefined;
 }
+
 function downloadUrl(identifier, filename) {
   return `${ARCHIVE_DOWNLOAD_URL}/${encodeURIComponent(identifier)}/${encodeURIComponent(filename)}`;
 }
@@ -354,16 +361,17 @@ function findPairedVideo(files, baseKey) {
 
 function buildTrackFromGroup(identifier, group, meta, includeVideo, allFiles) {
   const file = group.file;
+  const artworkURL = resolveArtwork(identifier, allFiles);
   const track = {
     id: b64urlEncode({ i: identifier, f: file.name }),
     title: fileTitle(file),
     artist: creatorName(meta),
-    album: cleanText(meta?.metadata?.title || identifier, 100),
-    duration: parseDurationSeconds(file) ?? 0, // v2: always numeric, never undefined
-    artworkURL: albumArtwork(identifier),
+    album: cleanText(meta?.metadata?.title || identifier, 90),
+    duration: parseDurationSeconds(file) ?? 0,
     format: mapFormatField(file),
     streamURL: downloadUrl(identifier, file.name),
   };
+  if (artworkURL) track.artworkURL = artworkURL;
   if (Number.isInteger(group.trackNumber)) track.trackNumber = group.trackNumber;
   if (includeVideo) {
     const vid = findPairedVideo(allFiles, normalizeBaseName(file.name));
@@ -384,7 +392,7 @@ function manifest(category) {
   return {
     id: `${ADDON_ID}.${category}`,
     name: category === "all" ? ADDON_NAME : `${ADDON_NAME} — ${cat.label}`,
-    version: "2.0.0",
+    version: "3.0.0",
     description: ADDON_DESC,
     icon: ADDON_ICON,
     resources: ["search", "stream", "catalog", "settings"],
@@ -402,7 +410,7 @@ function manifest(category) {
         key: "includeVideo",
         type: "toggle",
         label: "Include paired video when available",
-        help: "Some archive.org recordings include a matching video file alongside the audio (e.g. multi-camera concert uploads). When on, Eclipse shows a video toggle for those tracks.",
+        help: "Some archive.org recordings include a matching video file alongside the audio. When on, Eclipse shows a video toggle for those tracks.",
         default: false,
       },
     ],
@@ -491,23 +499,29 @@ async function searchHandler(u, category) {
   const preferLossless = u.searchParams.get("preferLossless") !== "false";
   const includeVideo = u.searchParams.get("includeVideo") === "true";
   const catDef = CATEGORIES[category] || CATEGORIES.all;
+  const catFilter = catDef.collectionFilter ? ` AND ${catDef.collectionFilter}` : "";
+  const lucQ = luceneEscape(q);
 
-  let query = `(${luceneEscape(q)}) AND mediatype:(audio)`;
-  if (catDef.collectionFilter) query += ` AND ${catDef.collectionFilter}`;
+  // v3: precise creator match (mirrors what archive.org's own creator
+  // search does) run alongside a field-scoped broad match — NOT a raw
+  // unscoped full-text scan, which is what surfaced unrelated items.
+  const creatorQuery = `creator:("${lucQ}") AND mediatype:(audio)${catFilter}`;
+  const broadQuery = `(title:("${lucQ}") OR creator:("${lucQ}") OR description:("${lucQ}")) AND mediatype:(audio)${catFilter}`;
 
-  // v2: no forced sort — let archive.org rank by relevance for text queries.
-  const rawDocs = await archiveSearch({ q: query, rows: 24, sort: null });
-  const docs = boostExactMatches(rawDocs, q);
+  const [creatorDocs, broadDocsRaw] = await Promise.all([
+    archiveSearch({ q: creatorQuery, rows: 16, sort: "downloads desc" }),
+    archiveSearch({ q: broadQuery, rows: 16, sort: null }),
+  ]);
+  const broadDocs = boostExactMatches(broadDocsRaw, q);
+  const docs = dedupeDocsByIdentifier([creatorDocs, broadDocs]);
 
-  const albums = docs.map((d) => ({
+  const albums = docs.slice(0, SEARCH_ALBUM_LIMIT).map((d) => ({
     id: d.identifier,
-    title: cleanText(d.title || d.identifier, 100),
-    artist: cleanText(Array.isArray(d.creator) ? d.creator.join(", ") : d.creator || "Unknown", 80),
-    artworkURL: albumArtwork(d.identifier),
+    title: cleanText(d.title || d.identifier, 80),
+    artist: cleanText(Array.isArray(d.creator) ? d.creator.join(", ") : d.creator || "Unknown", 60),
     year: (d.date || "").slice(0, 4) || undefined,
   }));
 
-  // v2: fully parallel for this small top-N set — no artificial queueing.
   const topDocs = docs.slice(0, SEARCH_ENRICH_COUNT);
   const metas = await Promise.all(topDocs.map((d) => archiveMetadata(d.identifier, METADATA_TIMEOUT_FAST_MS)));
   const tracks = [];
@@ -525,10 +539,9 @@ async function searchHandler(u, category) {
       if (key && !creatorSet.has(key)) creatorSet.set(key, d);
     }
   }
-  const artists = [...creatorSet.entries()].slice(0, 10).map(([name, d]) => ({
+  const artists = [...creatorSet.keys()].slice(0, SEARCH_ARTIST_LIMIT).map((name) => ({
     id: b64urlEncode({ c: name }),
-    name: cleanText(name, 80),
-    artworkURL: albumArtwork(d.identifier),
+    name: cleanText(name, 60),
   }));
 
   return jsonResp({ tracks, albums, artists, playlists: [] }, 200, 120);
@@ -562,22 +575,25 @@ async function albumHandler(identifier, u) {
     return jsonResp({
       fileCount: meta.files.length,
       groupCount: groups.length,
+      resolvedArtwork: resolveArtwork(identifier, meta.files) || null,
       groups: groups.map((g) => ({ file: g.file.name, format: g.file.format, score: g.score, trackNumber: g.trackNumber })),
     }, 200, 0);
   }
 
   const tracks = groups.map((g) => buildTrackFromGroup(identifier, g, meta, includeVideo, meta.files));
+  const artworkURL = resolveArtwork(identifier, meta.files);
 
-  return jsonResp({
+  const result = {
     id: identifier,
-    title: cleanText(meta.metadata?.title || identifier, 100),
+    title: cleanText(meta.metadata?.title || identifier, 80),
     artist: creatorName(meta),
-    artworkURL: albumArtwork(identifier),
     year: (meta.metadata?.date || "").slice(0, 4) || undefined,
-    description: meta.metadata?.description ? cleanText(stripHtml(meta.metadata.description), 300) : undefined,
+    description: meta.metadata?.description ? cleanText(stripHtml(meta.metadata.description), 250) : undefined,
     trackCount: tracks.length,
     tracks,
-  }, 200, 300);
+  };
+  if (artworkURL) result.artworkURL = artworkURL;
+  return jsonResp(result, 200, 300);
 }
 
 async function artistHandler(idParam, u) {
@@ -590,31 +606,33 @@ async function artistHandler(idParam, u) {
   const preferLossless = u.searchParams.get("preferLossless") !== "false";
   const includeVideo = u.searchParams.get("includeVideo") === "true";
 
-  const docs = await archiveSearch({ q: `creator:("${luceneEscape(creator)}") AND mediatype:(audio)`, rows: 40, sort: "downloads desc" });
+  const docs = await archiveSearch({ q: `creator:("${luceneEscape(creator)}") AND mediatype:(audio)`, rows: ARTIST_ALBUM_LIMIT, sort: "downloads desc" });
   const albums = docs.map((d) => ({
     id: d.identifier,
-    title: cleanText(d.title || d.identifier, 100),
-    artist: cleanText(creator, 80),
-    artworkURL: albumArtwork(d.identifier),
+    title: cleanText(d.title || d.identifier, 80),
+    artist: cleanText(creator, 60),
     year: (d.date || "").slice(0, 4) || undefined,
   }));
 
   const topDocs = docs.slice(0, ARTIST_TOP_TRACK_ITEMS);
   const metas = await Promise.all(topDocs.map((d) => archiveMetadata(d.identifier, METADATA_TIMEOUT_FAST_MS)));
   const topTracks = [];
+  let artistArtwork;
   metas.forEach((meta, idx) => {
     if (!meta || !Array.isArray(meta.files)) return;
+    if (!artistArtwork) artistArtwork = resolveArtwork(topDocs[idx].identifier, meta.files);
     const groups = groupAudioFiles(meta.files, preferLossless).slice(0, 3);
     for (const g of groups) topTracks.push(buildTrackFromGroup(topDocs[idx].identifier, g, meta, includeVideo, meta.files));
   });
 
-  return jsonResp({
+  const result = {
     id: idParam,
-    name: cleanText(creator, 80),
-    artworkURL: docs[0] ? albumArtwork(docs[0].identifier) : undefined,
+    name: cleanText(creator, 60),
     topTracks,
     albums,
-  }, 200, 300);
+  };
+  if (artistArtwork) result.artworkURL = artistArtwork;
+  return jsonResp(result, 200, 300);
 }
 
 async function playlistHandler(identifier, u) {
@@ -633,15 +651,17 @@ async function playlistHandler(identifier, u) {
   });
 
   const cName = collectionMeta ? creatorName(collectionMeta) : "Unknown";
+  const artworkURL = collectionMeta ? resolveArtwork(identifier, collectionMeta.files) : undefined;
 
-  return jsonResp({
+  const result = {
     id: identifier,
-    title: cleanText(collectionMeta?.metadata?.title || identifier, 100),
-    description: collectionMeta?.metadata?.description ? cleanText(stripHtml(collectionMeta.metadata.description), 300) : undefined,
-    artworkURL: albumArtwork(identifier),
+    title: cleanText(collectionMeta?.metadata?.title || identifier, 80),
+    description: collectionMeta?.metadata?.description ? cleanText(stripHtml(collectionMeta.metadata.description), 250) : undefined,
     creator: cName !== "Unknown" ? cName : undefined,
     tracks,
-  }, 200, 300);
+  };
+  if (artworkURL) result.artworkURL = artworkURL;
+  return jsonResp(result, 200, 300);
 }
 
 // ─── Router ──────────────────────────────────────────────────────────────────
