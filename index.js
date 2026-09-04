@@ -1,33 +1,58 @@
 /**
  * Internet Archive Addon — Cloudflare Worker (for Eclipse Music)
  *
- * v6 — FINAL FIXES: grouping-by-track-number, artwork reverted to v3,
- * no track caps.
+ * v7 — FINAL: real search relevance, real artist matching, real quality
+ * display.
  *
- * - FIXED FLAC/quality never showing: many archive.org live-concert
- *   (etree) items name their lossless FLAC master completely differently
- *   from their auto-derived MP3 ("gd77-05-08d1t01.flac" vs "01 - Song
- *   Name.mp3") — no filename normalization can match those, so v5's
- *   suffix-stripping fix still missed this very common case, and MP3
- *   kept winning by default because it was never actually compared
- *   against its FLAC counterpart. Grouping now keys primarily on TRACK
- *   NUMBER metadata (which archive.org keeps consistent across
- *   renditions of the same track regardless of filename scheme), falling
- *   back to filename normalization only when no track number exists.
- *   Also added a hard failsafe: if a lossless file (FLAC/WAV) exists
- *   anywhere in a group and preferLossless is on, it is always chosen
- *   over a lossy one regardless of scoring edge cases. `format` is the
- *   only quality signal Eclipse can show on a track (per the addon spec,
- *   the `quality` text field only exists in the /stream response, which
- *   Eclipse skips whenever a track already has a streamURL) — so getting
- *   `format` right is the actual fix.
- * - REVERTED artwork to exactly v3 behavior per request: artworkURL is
- *   only set when a real per-item cover file is found in the item's own
- *   files (tagged Item Tile/Item Image/Thumbnail, or named cover/front/
- *   folder). No generic archive.org thumbnail-service fallback, no width
- *   constraints — omitted entirely when no real file exists.
- * - REMOVED the album/artist/playlist track-count cap entirely per
- *   request — every track is returned, no matter how large the item.
+ * - FIXED quality/format never showing beyond a bare mp3 label: Eclipse's
+ *   docs are explicit — the descriptive `quality` text field ("lossless",
+ *   "320kbps", etc.) ONLY exists in the /stream/{id} RESPONSE. Eclipse
+ *   only calls /stream when a track has no `streamURL` on it already.
+ *   Every track here has always carried a direct streamURL (so saved/
+ *   offline tracks keep working), which meant Eclipse was silently
+ *   SKIPPING /stream and never seeing quality info at all — no amount of
+ *   fixing the FLAC-selection logic could have shown it, because the
+ *   field that carries it was never being requested. FIX: streamURL is
+ *   removed from track objects entirely. Eclipse now always calls
+ *   /stream/{id} to play, and that response returns a real, descriptive
+ *   `quality` string (e.g. "FLAC (Lossless)", "24-bit FLAC (Lossless)",
+ *   "VBR MP3", "128kbps MP3") built directly from the file's own
+ *   archive.org format string — plus the correct `format` enum value.
+ *   All the info /stream needs is embedded directly in the track's id
+ *   (identifier + filename + precomputed format/quality), so this adds
+ *   no extra archive.org request — /stream responds instantly.
+ * - FIXED "searching 'evol future' only shows a hollow artist with
+ *   nothing in it, doesn't show the real Evol album by Future": the
+ *   query was matching an exact PHRASE against ONE field at a time
+ *   (title:("evol future") or creator:("evol future")) — but real items
+ *   split the words across fields (title "Evol", creator "Future"), so
+ *   neither field ever contained the literal phrase and nothing matched.
+ *   Search's primary results now use an UNSCOPED query — the same kind
+ *   of plain relevance search archive.org's own search bar performs —
+ *   so a query like "evol future" naturally surfaces the real "Evol
+ *   (FLAC) by Future" item, exactly like the screenshot. The old
+ *   "guarantee a placeholder artist" fallback (the actual source of the
+ *   hollow "Evol Future" artist with nothing in it) is removed entirely
+ *   — artists are only ever built from real creator metadata that
+ *   actually exists in the results.
+ * - FIXED "Future" pulling in Odd Future / Future D. tracks on both the
+ *   search page AND his artist page: creator:("query") is a tokenized
+ *   phrase match, so it matches ANY creator field containing that word,
+ *   which is why "Odd Future" and "Future D." kept polluting results
+ *   even after exact-match ranking (ranking just reordered the noise, it
+ *   didn't remove it — and the artist PAGE itself re-ran the same loose
+ *   query with no filtering at all). Artist-scoped queries (both the
+ *   search page's artist list AND clicking into an artist page) now
+ *   FILTER results to items whose creator field, split on common
+ *   multi-artist delimiters, contains a token that's an EXACT
+ *   case-insensitive match to the artist name — not just a substring
+ *   match — so "Future" no longer pulls in "Odd Future" or "Future D."
+ *   on either the search results or the dedicated artist page.
+ *
+ * ── Mapping onto archive.org ─────────────────────────────────────────────
+ * - "album" -> an archive.org item. "track" -> an audio file inside it.
+ * - "artist" -> the `creator` metadata field.
+ * - "playlist" -> an archive.org "collection".
  */
 
 // ─── Config ─────────────────────────────────────────────────────────────────
@@ -130,6 +155,29 @@ async function mapWithConcurrency(items, limit, fn) {
   return results;
 }
 
+// ─── Artist name matching ───────────────────────────────────────────────────
+// v7: creator fields are sometimes multi-artist strings ("Future & Drake",
+// "Future; Metro Boomin", "Future feat. Drake"). Splitting on common
+// delimiters and requiring an EXACT token match (not substring) is what
+// stops "Future" from matching "Odd Future" or "Future D." — a substring
+// check would still let those through.
+function splitCreatorTokens(name) {
+  return String(name || "")
+    .split(/[;,&/]| feat\.?| featuring | x | with /i)
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+function creatorFieldMatchesExactly(creatorField, targetLower) {
+  const names = Array.isArray(creatorField) ? creatorField : creatorField ? [creatorField] : [];
+  for (const name of names) {
+    if (name.trim().toLowerCase() === targetLower) return true;
+    for (const token of splitCreatorTokens(name)) {
+      if (token.toLowerCase() === targetLower) return true;
+    }
+  }
+  return false;
+}
+
 // ─── archive.org API calls ──────────────────────────────────────────────────
 async function archiveSearch({ q, rows = 25, page = 1, sort = null, fields = ["identifier", "title", "creator", "date", "downloads", "mediatype", "collection"] }) {
   const url = new URL(ARCHIVE_SEARCH_URL);
@@ -176,40 +224,6 @@ function dedupeDocsByIdentifier(lists) {
   return out;
 }
 
-function boostExactMatches(docs, query) {
-  const q = String(query || "").trim().toLowerCase();
-  if (!q) return docs;
-  const strong = [];
-  const rest = [];
-  for (const d of docs) {
-    const title = (d.title || "").toLowerCase();
-    const creators = Array.isArray(d.creator) ? d.creator.join(" ").toLowerCase() : (d.creator || "").toLowerCase();
-    if (title.includes(q) || creators.includes(q)) strong.push(d);
-    else rest.push(d);
-  }
-  return [...strong, ...rest];
-}
-
-function buildArtistList(docs, rawQuery, limit) {
-  const q = rawQuery.trim().toLowerCase();
-  const exact = new Map();
-  const partial = new Map();
-  for (const d of docs) {
-    const names = Array.isArray(d.creator) ? d.creator : d.creator ? [d.creator] : [];
-    for (const name of names) {
-      const key = name.trim();
-      if (!key) continue;
-      const lower = key.toLowerCase();
-      if (lower === q) { if (!exact.has(key)) exact.set(key, d); }
-      else if (lower.includes(q)) { if (!partial.has(key)) partial.set(key, d); }
-    }
-  }
-  const orderedNames = [...exact.keys(), ...partial.keys()];
-  const hasCloseMatch = orderedNames.some((n) => n.toLowerCase() === q);
-  const finalNames = hasCloseMatch ? orderedNames : [rawQuery.trim(), ...orderedNames];
-  return finalNames.slice(0, limit).map((name) => ({ id: b64urlEncode({ c: name }), name: cleanText(name, 60) }));
-}
-
 // ─── Audio file filtering, scoring, grouping ───────────────────────────────
 const AUDIO_FORMAT_KEYWORDS = /flac|mp3|ogg|vorbis|\bwav\b|wave|ape|alac|aiff|shorten|\bshn\b|m4a|aac|opus/i;
 const VIDEO_EXT = /\.(mp4|m4v|webm|mov)$/i;
@@ -253,6 +267,9 @@ function formatScore(file, preferLossless) {
   return 10;
 }
 
+// Eclipse's `format` enum is exactly mp3/flac/aac/m4a — WAV and Ogg
+// Vorbis aren't in it, so they're mapped to their nearest lossless/lossy
+// equivalent for display (the actual streamed file is unaffected).
 function mapFormatField(file) {
   const f = (file.format || "").toLowerCase();
   const name = (file.name || "").toLowerCase();
@@ -262,6 +279,29 @@ function mapFormatField(file) {
   if (f.includes("aac") || name.endsWith(".aac")) return "aac";
   if (f.includes("ogg") || f.includes("vorbis") || name.endsWith(".ogg")) return "aac";
   return "mp3";
+}
+
+// v7: builds the descriptive quality string that only ever reaches
+// Eclipse via the /stream response's `quality` field — this is the piece
+// that was never being seen at all while tracks carried a streamURL.
+function qualityLabelForFile(file) {
+  const raw = (file.format || "").trim();
+  const f = raw.toLowerCase();
+  if (/24bit flac/.test(f)) return "24-bit FLAC (Lossless)";
+  if (/flac/.test(f)) return "FLAC (Lossless)";
+  if (/wave|\bwav\b/.test(f)) return "WAV (Lossless)";
+  if (/apple lossless|alac/.test(f)) return "Apple Lossless (ALAC)";
+  if (/vbr mp3/.test(f)) return "VBR MP3";
+  if (/320kbps mp3/.test(f)) return "320kbps MP3";
+  if (/256kbps mp3/.test(f)) return "256kbps MP3";
+  if (/192kbps mp3/.test(f)) return "192kbps MP3";
+  if (/128kbps mp3/.test(f)) return "128kbps MP3";
+  if (/64kbps mp3/.test(f)) return "64kbps MP3";
+  if (/mp3/.test(f)) return "MP3";
+  if (/ogg vorbis/.test(f)) return "Ogg Vorbis";
+  if (/m4a/.test(f)) return "M4A";
+  if (/aac/.test(f)) return "AAC";
+  return raw || "Standard";
 }
 
 const RENDITION_SUFFIX_RE = /[_\-\s]?(64kb?ps?|128kb?ps?|192kb?ps?|256kb?ps?|320kb?ps?|vbr|64k|128k|192k|256k|320k)$/i;
@@ -285,13 +325,9 @@ function parseTrackNumber(file) {
   return null;
 }
 
-// v6: THE actual fix for FLAC never being selected. Many live-concert
-// (etree) items name their FLAC master completely differently from their
-// MP3 derivative ("gd77-05-08d1t01.flac" vs "01 - Song Name.mp3") — no
-// filename cleanup can match those. Grouping now keys primarily on the
-// file's own `track` metadata number (which archive.org keeps consistent
-// across every rendition of the same track), falling back to filename
-// normalization only when no track number is present at all.
+// Groups by track-number metadata first (consistent across renditions of
+// the same track regardless of filename scheme), falls back to filename
+// normalization only when no track number exists at all.
 function groupKeyForFile(file) {
   const tn = parseTrackNumber(file);
   if (tn != null) return `#${tn}`;
@@ -328,12 +364,9 @@ function fileTitle(file) {
   return cleanText(cleaned, 90);
 }
 
-// v6: groups by track-number first (see groupKeyForFile), keeps every
-// member of the group, and — critically — applies a hard failsafe after
-// scoring: if ANY member of the group is lossless and preferLossless is
-// on, that lossless file is always the one chosen, regardless of any
-// scoring edge case. This directly guarantees FLAC wins whenever it's
-// genuinely present alongside an MP3 of the same track.
+// Groups renditions of the same track by track-number, keeps every
+// member, and hard-guarantees a lossless pick whenever one genuinely
+// exists in the group and preferLossless is on.
 function groupAudioFiles(files, preferLossless) {
   const audioFiles = (files || []).filter(isAudioFile);
   const groups = new Map();
@@ -375,9 +408,8 @@ function creatorName(meta) {
   return cleanText(names.join(", "), 60);
 }
 
-// v6: reverted exactly to v3 behavior per request — real per-item cover
-// file only, omitted entirely (no service-thumbnail fallback) when none
-// exists.
+// Real per-item cover file only — no generic thumbnail-service fallback,
+// omitted entirely when no real cover exists (per explicit request).
 function resolveArtwork(identifier, files) {
   if (!Array.isArray(files)) return undefined;
   const tagged = files.find((f) => f.name && IMAGE_EXT.test(f.name) && /item tile|item image|thumbnail/i.test(f.format || ""));
@@ -394,17 +426,23 @@ function findPairedVideo(files, baseKey) {
   return (files || []).find((f) => VIDEO_EXT.test(f.name || "") && normalizeBaseName(f.name) === baseKey) || null;
 }
 
+// v7: id now carries everything /stream needs (identifier, filename,
+// precomputed format + quality label) so /stream can respond instantly
+// without a second archive.org round-trip. streamURL is intentionally
+// NOT included — this is what makes Eclipse actually call /stream and
+// see the quality info instead of skipping straight to playback.
 function buildTrackFromGroup(identifier, group, meta, includeVideo, allFiles) {
   const file = group.file;
   const artworkURL = resolveArtwork(identifier, allFiles);
+  const format = mapFormatField(file);
+  const quality = qualityLabelForFile(file);
   const track = {
-    id: b64urlEncode({ i: identifier, f: file.name }),
+    id: b64urlEncode({ i: identifier, f: file.name, fmt: format, q: quality }),
     title: fileTitle(file),
     artist: creatorName(meta),
     album: cleanText(meta?.metadata?.title || identifier, 90),
     duration: bestDurationForGroup(group),
-    format: mapFormatField(file),
-    streamURL: downloadUrl(identifier, file.name),
+    format,
   };
   if (artworkURL) track.artworkURL = artworkURL;
   if (Number.isInteger(group.trackNumber)) track.trackNumber = group.trackNumber;
@@ -427,7 +465,7 @@ function manifest(category) {
   return {
     id: `${ADDON_ID}.${category}`,
     name: category === "all" ? ADDON_NAME : `${ADDON_NAME} — ${cat.label}`,
-    version: "6.0.0",
+    version: "7.0.0",
     description: ADDON_DESC,
     icon: ADDON_ICON,
     resources: ["search", "stream", "catalog", "settings"],
@@ -527,6 +565,13 @@ async function generateHandler(u, base) {
   return jsonResp({ category, token, manifestUrl: `${base}/${slug}/manifest.json` });
 }
 
+// v7: primary results now come from an UNSCOPED query — plain relevance
+// search across the whole item, mirroring archive.org's own search bar
+// — instead of restrictive per-field phrase matching that silently
+// matched nothing when a query's words were split across fields (title
+// vs creator). A separate, STRICTLY creator-filtered query still runs in
+// parallel purely to power the artist list, so distinct-artist lookups
+// stay accurate without polluting or replacing the main relevance results.
 async function searchHandler(u, category) {
   const q = (u.searchParams.get("q") || "").trim();
   if (!q) return jsonResp({ tracks: [], albums: [], artists: [], playlists: [] }, 200, 60);
@@ -537,15 +582,18 @@ async function searchHandler(u, category) {
   const catFilter = catDef.collectionFilter ? ` AND ${catDef.collectionFilter}` : "";
   const lucQ = luceneEscape(q);
 
+  const relevanceQuery = `(${lucQ}) AND mediatype:(audio)${catFilter}`;
   const creatorQuery = `creator:("${lucQ}") AND mediatype:(audio)${catFilter}`;
-  const broadQuery = `(title:("${lucQ}") OR creator:("${lucQ}") OR description:("${lucQ}")) AND mediatype:(audio)${catFilter}`;
 
-  const [creatorDocs, broadDocsRaw] = await Promise.all([
-    archiveSearch({ q: creatorQuery, rows: 16, sort: "downloads desc" }),
-    archiveSearch({ q: broadQuery, rows: 16, sort: null }),
+  const [relevanceDocs, creatorDocsRaw] = await Promise.all([
+    archiveSearch({ q: relevanceQuery, rows: 24, sort: null }),
+    archiveSearch({ q: creatorQuery, rows: 20, sort: "downloads desc" }),
   ]);
-  const broadDocs = boostExactMatches(broadDocsRaw, q);
-  const docs = dedupeDocsByIdentifier([creatorDocs, broadDocs]);
+
+  const qLower = q.toLowerCase();
+  const creatorDocs = creatorDocsRaw.filter((d) => creatorFieldMatchesExactly(d.creator, qLower));
+
+  const docs = dedupeDocsByIdentifier([creatorDocs, relevanceDocs]);
 
   const albums = docs.slice(0, SEARCH_ALBUM_LIMIT).map((d) => ({
     id: d.identifier,
@@ -563,23 +611,41 @@ async function searchHandler(u, category) {
     for (const g of groups) tracks.push(buildTrackFromGroup(topDocs[idx].identifier, g, meta, includeVideo, meta.files));
   });
 
-  const artists = buildArtistList(docs, q, SEARCH_ARTIST_LIMIT);
+  // Artists list built ONLY from real, exact-matching creator metadata —
+  // no synthetic/placeholder entries when nothing genuinely matches.
+  const artistMap = new Map();
+  for (const d of creatorDocs) {
+    const names = Array.isArray(d.creator) ? d.creator : d.creator ? [d.creator] : [];
+    for (const name of names) {
+      for (const token of splitCreatorTokens(name)) {
+        if (token.toLowerCase() === qLower && !artistMap.has(token)) artistMap.set(token, d);
+      }
+    }
+  }
+  const artists = [...artistMap.entries()].slice(0, SEARCH_ARTIST_LIMIT).map(([name]) => ({
+    id: b64urlEncode({ c: name }),
+    name: cleanText(name, 60),
+  }));
 
   return jsonResp({ tracks, albums, artists, playlists: [] }, 200, 120);
 }
 
+// v7: id now embeds precomputed format/quality — no archive.org
+// round-trip needed, /stream responds immediately.
 async function streamHandler(idParam) {
-  let identifier, filename;
+  let identifier, filename, format, quality;
   try {
-    ({ i: identifier, f: filename } = b64urlDecode(idParam));
+    ({ i: identifier, f: filename, fmt: format, q: quality } = b64urlDecode(idParam));
   } catch (e) {
     return jsonResp({ error: "Invalid track id" }, 400);
   }
   if (!identifier || !filename) return jsonResp({ error: "Invalid track id" }, 400);
   const url = downloadUrl(identifier, filename);
-  const format = mapFormatField({ name: filename });
-  const quality = /flac|wav|alac/i.test(filename) ? "Lossless" : "Standard";
-  return jsonResp({ url, format, quality });
+  return jsonResp({
+    url,
+    format: format || mapFormatField({ name: filename }),
+    quality: quality || (/flac|wav|alac/i.test(filename) ? "Lossless" : "Standard"),
+  });
 }
 
 async function albumHandler(identifier, u) {
@@ -601,6 +667,7 @@ async function albumHandler(identifier, u) {
         file: g.file.name,
         format: g.file.format,
         mappedFormat: mapFormatField(g.file),
+        qualityLabel: qualityLabelForFile(g.file),
         score: g.score,
         trackNumber: g.trackNumber,
         chosenDuration: bestDurationForGroup(g),
@@ -625,6 +692,9 @@ async function albumHandler(identifier, u) {
   return jsonResp(result, 200, 300);
 }
 
+// v7: strictly filters to items whose creator field contains an EXACT
+// match to the artist name — this is what stops "Future"'s page from
+// being flooded with "Odd Future" / "Future D." items.
 async function artistHandler(idParam, u) {
   let creator;
   try {
@@ -635,14 +705,12 @@ async function artistHandler(idParam, u) {
   const preferLossless = u.searchParams.get("preferLossless") !== "false";
   const includeVideo = u.searchParams.get("includeVideo") === "true";
   const lucC = luceneEscape(creator);
+  const creatorLower = creator.trim().toLowerCase();
 
-  const [creatorDocsRaw, titleDocsRaw] = await Promise.all([
-    archiveSearch({ q: `creator:("${lucC}") AND mediatype:(audio)`, rows: ARTIST_ALBUM_LIMIT, sort: "downloads desc" }),
-    archiveSearch({ q: `title:("${lucC}") AND mediatype:(audio)`, rows: ARTIST_ALBUM_LIMIT, sort: "downloads desc" }),
-  ]);
-  const docs = dedupeDocsByIdentifier([creatorDocsRaw, titleDocsRaw]);
+  const rawDocs = await archiveSearch({ q: `creator:("${lucC}") AND mediatype:(audio)`, rows: 80, sort: "downloads desc" });
+  const docs = rawDocs.filter((d) => creatorFieldMatchesExactly(d.creator, creatorLower)).slice(0, ARTIST_ALBUM_LIMIT);
 
-  const albums = docs.slice(0, ARTIST_ALBUM_LIMIT).map((d) => ({
+  const albums = docs.map((d) => ({
     id: d.identifier,
     title: cleanText(d.title || d.identifier, 80),
     artist: cleanText(creator, 60),
