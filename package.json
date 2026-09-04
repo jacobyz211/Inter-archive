@@ -1,0 +1,15 @@
+{
+  "name": "eclipse-internet-archive-addon",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Internet Archive addon for Eclipse Music — search, browse, and stream music, live concerts, audiobooks, old-time radio, and podcasts directly from archive.org. Prefers lossless FLAC/WAV when available.",
+  "main": "index.js",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail"
+  },
+  "devDependencies": {
+    "wrangler": "^3.90.0"
+  }
+}
